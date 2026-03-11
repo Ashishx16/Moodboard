@@ -2,29 +2,36 @@ const https = require("https");
 
 function fetchUrl(url) {
   return new Promise((resolve, reject) => {
-    const req = https.get(
-      url,
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.5",
-          "Accept-Encoding": "identity",
-          "Cache-Control": "no-cache",
-        },
+    const req = https.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache",
       },
-      (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return fetchUrl(res.headers.location).then(resolve).catch(reject);
-        }
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => resolve(data));
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchUrl(res.headers.location).then(resolve).catch(reject);
       }
-    );
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve(data));
+    });
     req.on("error", reject);
     req.setTimeout(15000, () => { req.destroy(); reject(new Error("Timeout")); });
   });
+}
+
+// Upgrade any Pinterest image URL to the highest available resolution (1200x)
+function upgradeToHighestRes(url) {
+  return url.replace(/\/\d+x\//, "/1200x/");
+}
+
+// Extract unique image ID for deduplication across different size variants
+function getImageBase(url) {
+  const match = url.match(/\/([a-f0-9]+)\.(jpg|jpeg|png|webp)$/i);
+  return match ? match[1] : url;
 }
 
 exports.handler = async function (event) {
@@ -45,26 +52,25 @@ exports.handler = async function (event) {
 
   try {
     const html = await fetchUrl(boardUrl);
-    const found = new Set();
 
-    // Pinterest embeds image URLs in the HTML as pinimg.com URLs
-    const matches = html.matchAll(/https:\/\/i\.pinimg\.com\/[^"'\s]+\.(?:jpg|jpeg|png|webp)/gi);
+    const seenBases = new Set();
+    const images = [];
+
+    const matches = [...html.matchAll(/https:\/\/i\.pinimg\.com\/[^"'\s\\]+\.(?:jpg|jpeg|png|webp)/gi)];
+
     for (const m of matches) {
-      // Upgrade to 736x (medium-high res)
-      const upgraded = m[0].replace(/\/\d+x\//, "/736x/");
-      found.add(upgraded);
+      const original = m[0];
+      const base = getImageBase(original);
+      if (seenBases.has(base)) continue;
+      seenBases.add(base);
+      images.push(upgradeToHighestRes(original));
     }
-
-    const images = [...found];
 
     if (images.length === 0) {
       return {
         statusCode: 200,
         headers,
-        body: JSON.stringify({
-          images: [],
-          note: "No images found. Make sure the board is public.",
-        }),
+        body: JSON.stringify({ images: [], note: "No images found. Make sure the board is public." }),
       };
     }
 
