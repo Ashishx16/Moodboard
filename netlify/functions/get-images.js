@@ -1,37 +1,26 @@
 const https = require("https");
 
-function fetchUrl(url) {
+function fetchJson(url) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "identity",
-        "Cache-Control": "no-cache",
+        "User-Agent": "Slideshow/1.0",
+        "Accept": "application/json",
       },
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchUrl(res.headers.location).then(resolve).catch(reject);
+        return fetchJson(res.headers.location).then(resolve).catch(reject);
       }
       let data = "";
       res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => resolve(data));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { reject(new Error("Invalid JSON: " + data.slice(0, 100))); }
+      });
     });
     req.on("error", reject);
     req.setTimeout(15000, () => { req.destroy(); reject(new Error("Timeout")); });
   });
-}
-
-// Upgrade any Pinterest image URL to the highest available resolution (1200x)
-function upgradeToHighestRes(url) {
-  return url.replace(/\/\d+x\//, "/1200x/");
-}
-
-// Extract unique image ID for deduplication across different size variants
-function getImageBase(url) {
-  const match = url.match(/\/([a-f0-9]+)\.(jpg|jpeg|png|webp)$/i);
-  return match ? match[1] : url;
 }
 
 exports.handler = async function (event) {
@@ -40,37 +29,67 @@ exports.handler = async function (event) {
     "Content-Type": "application/json",
   };
 
-  const boardUrl = event.queryStringParameters && event.queryStringParameters.board;
+  const slug = event.queryStringParameters && event.queryStringParameters.channel;
 
-  if (!boardUrl || !boardUrl.includes("pinterest.com")) {
+  if (!slug) {
     return {
       statusCode: 400,
       headers,
-      body: JSON.stringify({ error: "Missing or invalid Pinterest board URL" }),
+      body: JSON.stringify({ error: "Missing channel slug" }),
     };
   }
 
   try {
-    const html = await fetchUrl(boardUrl);
+    // Are.na API — fetch all blocks in the channel, paginated
+    // First call to get total count
+    const first = await fetchJson(`https://api.are.na/v2/channels/${slug}/contents?per=1`);
 
-    const seenBases = new Set();
+    if (!first || first.code === 404) {
+      return {
+        statusCode: 404,
+        headers,
+        body: JSON.stringify({ error: "Channel not found. Make sure it's public and the slug is correct." }),
+      };
+    }
+
+    const total = first.length || 0;
+    const perPage = 100;
+    const pages = Math.ceil(total / perPage);
+
+    // Fetch all pages in parallel
+    const pagePromises = [];
+    for (let i = 1; i <= pages; i++) {
+      pagePromises.push(
+        fetchJson(`https://api.are.na/v2/channels/${slug}/contents?per=${perPage}&page=${i}`)
+      );
+    }
+    const results = await Promise.all(pagePromises);
+
+    // Collect only image blocks
     const images = [];
-
-    const matches = [...html.matchAll(/https:\/\/i\.pinimg\.com\/[^"'\s\\]+\.(?:jpg|jpeg|png|webp)/gi)];
-
-    for (const m of matches) {
-      const original = m[0];
-      const base = getImageBase(original);
-      if (seenBases.has(base)) continue;
-      seenBases.add(base);
-      images.push(upgradeToHighestRes(original));
+    for (const page of results) {
+      const contents = page.contents || [];
+      for (const block of contents) {
+        // Only image blocks with a valid image URL
+        if (block.class === "Image" && block.image) {
+          // Prefer original > large > display size
+          const url =
+            (block.image.original && block.image.original.url) ||
+            (block.image.large && block.image.large.url) ||
+            (block.image.display && block.image.display.url);
+          if (url) images.push(url);
+        }
+      }
     }
 
     if (images.length === 0) {
       return {
         statusCode: 200,
         headers,
-        body: JSON.stringify({ images: [], note: "No images found. Make sure the board is public." }),
+        body: JSON.stringify({
+          images: [],
+          note: "No images found in this channel. Make sure it's public and contains image blocks.",
+        }),
       };
     }
 
